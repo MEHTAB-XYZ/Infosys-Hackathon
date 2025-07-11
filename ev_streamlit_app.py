@@ -1,3 +1,53 @@
+# Station capacity dictionary (car/scooter 20-30)
+station_capacity = {
+    "Connaught Place": {"car": 30, "scooter": 28},
+    "Nehru Place": {"car": 28, "scooter": 26},
+    "Rajouri Garden": {"car": 27, "scooter": 25},
+    "Saket": {"car": 29, "scooter": 27},
+    "Dwarka": {"car": 25, "scooter": 23},
+    "Karol Bagh": {"car": 26, "scooter": 24},
+    "Lajpat Nagar": {"car": 30, "scooter": 29},
+    "Vasant Kunj": {"car": 24, "scooter": 21},
+    "Preet Vihar": {"car": 22, "scooter": 20},
+    "Rohini": {"car": 20, "scooter": 20},
+}
+
+# Function to get overloaded stations
+def get_overloaded_stations(forecast_df, capacity_dict):
+    peak_df = (
+        forecast_df.groupby(['station_id', 'station_name', 'vehicle_type'], as_index=False)
+        .agg({'yhat': 'max'})
+        .rename(columns={'yhat': 'forecasted_peak'})
+    )
+    peak_df['capacity'] = peak_df.apply(
+        lambda row: capacity_dict.get(row['station_name'], {}).get(row['vehicle_type'], np.nan),
+        axis=1
+    )
+    peak_df['overload_pct'] = peak_df['forecasted_peak'] / peak_df['capacity']
+    peak_df['unmet_demand'] = peak_df['forecasted_peak'] - peak_df['capacity']
+    overloaded = peak_df[peak_df['overload_pct'] > 0.9]
+    message = ""
+    # Always show 3 stations: overloaded first, then next busiest
+    if overloaded.empty:
+        busiest = peak_df.sort_values('forecasted_peak', ascending=False).head(3)
+        busiest['recommendation'] = 'Monitor usage'
+        result = busiest
+        message = "No station exceeds 90% of its capacity. Showing top 3 busiest stations."
+    else:
+        overloaded = overloaded.copy()
+        overloaded['recommendation'] = overloaded['unmet_demand'].apply(
+            lambda x: f"Add {int(np.ceil(x/5))} more ports" if x > 0 else "Monitor usage"
+        )
+        # Get next busiest stations not overloaded
+        not_overloaded = peak_df[~peak_df.index.isin(overloaded.index)]
+        next_busiest = not_overloaded.sort_values('forecasted_peak', ascending=False).head(2)
+        next_busiest['recommendation'] = 'Monitor usage'
+        result = pd.concat([overloaded, next_busiest]).sort_values('forecasted_peak', ascending=False).head(3)
+        if (overloaded['forecasted_peak'] > overloaded['capacity']).any():
+            message = "Some stations exceed their maximum capacity! Immediate action required."
+        else:
+            message = "Some stations are above 90% capacity. Consider adding more ports."
+    return result[['station_id', 'vehicle_type', 'forecasted_peak', 'capacity', 'unmet_demand', 'recommendation']], message
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -50,6 +100,41 @@ else:
     forecast["latitude"] = ts["latitude"].iloc[0] if len(ts) > 0 else None
     forecast["longitude"] = ts["longitude"].iloc[0] if len(ts) > 0 else None
 
+    # Build a full forecast_df for all stations/types for overload analysis
+    all_forecast_rows = []
+    for s in df["station_name"].unique():
+        for vtype in ["car", "scooter"]:
+            mask = (df["station_name"] == s) & (df["vehicle_type"] == vtype)
+            train = df[train_mask & mask]
+            if not train.empty:
+                ts = train.groupby(["date", "hour", "latitude", "longitude"])["vehicles_charged"].sum().reset_index()
+                ts["ds"] = pd.to_datetime(ts["date"], format="%d-%m-%Y") + pd.to_timedelta(ts["hour"], unit="h")
+                ts = ts.rename(columns={"ds": "ds", "vehicles_charged": "y"})
+                m = Prophet()
+                m.fit(ts[["ds", "y"]])
+                future = pd.DataFrame({"ds": forecast_hours})
+                f = m.predict(future)
+                for _, row in f.iterrows():
+                    all_forecast_rows.append({
+                        "station_id": df[df["station_name"] == s]["station_id"].iloc[0],
+                        "station_name": s,
+                        "vehicle_type": vtype,
+                        "ds": row["ds"],
+                        "yhat": row["yhat"]
+                    })
+    forecast_df = pd.DataFrame(all_forecast_rows)
+
+    st.subheader("🔺 Overload or High-Usage Station Suggestions (Car)")
+    car_df = forecast_df[forecast_df["vehicle_type"] == "car"]
+    car_suggestions, car_message = get_overloaded_stations(car_df, station_capacity)
+    st.dataframe(car_suggestions)
+    st.info(car_message)
+
+    st.subheader("🔺 Overload or High-Usage Station Suggestions (Scooter)")
+    scooter_df = forecast_df[forecast_df["vehicle_type"] == "scooter"]
+    scooter_suggestions, scooter_message = get_overloaded_stations(scooter_df, station_capacity)
+    st.dataframe(scooter_suggestions)
+    st.info(scooter_message)
     st.subheader(f"Forecasted Demand for {station} ({vehicle_type}) on {date}")
     fig, ax = plt.subplots(figsize=(10, 5))
     ax.plot(forecast["ds"], forecast["yhat"], marker='o', color='tab:blue', label='Predicted Demand')
